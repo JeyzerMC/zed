@@ -1002,6 +1002,7 @@ impl ThreadView {
             MessageEditorEvent::LostFocus => {}
             MessageEditorEvent::SlashAutocompleteOpened => {}
             MessageEditorEvent::InputAttempted { .. } => {}
+            MessageEditorEvent::Edited => {}
         }
     }
 
@@ -1142,6 +1143,7 @@ impl ThreadView {
             }
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::SlashAutocompleteOpened) => {
             }
+            ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::Edited) => {}
             ViewEvent::MessageEditorEvent(_editor, MessageEditorEvent::InputAttempted { .. }) => {}
             ViewEvent::OpenDiffLocation {
                 path,

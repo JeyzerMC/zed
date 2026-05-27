@@ -10,7 +10,6 @@ use agent_ui::terminal_thread_metadata_store::{
 use agent_ui::thread_metadata_store::{
     ThreadMetadata, ThreadMetadataStore, WorktreePaths, worktree_info_from_thread_paths,
 };
-use agent_ui::thread_worktree_archive;
 use agent_ui::threads_archive_view::{
     ThreadsArchiveView, ThreadsArchiveViewEvent, format_history_entry_timestamp,
     fuzzy_match_positions,
@@ -21,6 +20,7 @@ use agent_ui::{
     NewThread, RenameSelectedThread, TerminalId, ThreadId, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,
 };
+use agent_ui::{MessageEditorEvent, StateChange, thread_worktree_archive};
 use chrono::{DateTime, Utc};
 use editor::Editor;
 use feature_flags::{
@@ -686,6 +686,7 @@ pub struct Sidebar {
     project_header_menu_ix: Option<usize>,
     _subscriptions: Vec<gpui::Subscription>,
     _draft_editor_observations: Vec<gpui::Subscription>,
+    update_task: Option<Task<()>>,
     /// For the thread import banners, if there is just one we show "Import
     /// Threads" but if we are showing both the external agents and other
     /// channels import banners then we change the text to disambiguate the
@@ -720,15 +721,15 @@ impl Sidebar {
                 MultiWorkspaceEvent::ActiveWorkspaceChanged { .. } => {
                     this.sync_active_entry_from_active_workspace(cx);
                     this.replace_archived_panel_thread(window, cx);
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
                 MultiWorkspaceEvent::WorkspaceAdded(workspace) => {
                     this.subscribe_to_workspace(workspace, window, cx);
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
                 MultiWorkspaceEvent::WorkspaceRemoved(_)
                 | MultiWorkspaceEvent::ProjectGroupsChanged => {
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
             },
         )
@@ -740,10 +741,7 @@ impl Sidebar {
                 if !query.is_empty() {
                     this.selection.take();
                 }
-                this.update_entries(cx);
-                if !query.is_empty() {
-                    this.select_first_entry();
-                }
+                this.schedule_update_entries(!query.is_empty(), cx);
             }
         })
         .detach();
@@ -758,14 +756,14 @@ impl Sidebar {
         .detach();
 
         cx.observe(&ThreadMetadataStore::global(cx), |this, _store, cx| {
-            this.update_entries(cx);
+            this.schedule_update_entries(false, cx);
         })
         .detach();
 
         cx.observe(
             &TerminalThreadMetadataStore::global(cx),
             |this, _store, cx| {
-                this.update_entries(cx);
+                this.schedule_update_entries(false, cx);
             },
         )
         .detach();
@@ -778,7 +776,7 @@ impl Sidebar {
                     this.subscribe_to_workspace(workspace, window, cx);
                 }
             }
-            this.update_entries(cx);
+            this.schedule_update_entries(false, cx);
         });
 
         Self {
@@ -808,6 +806,7 @@ impl Sidebar {
             project_header_menu_ix: None,
             _subscriptions: Vec::new(),
             _draft_editor_observations: Vec::new(),
+            update_task: None,
             import_banners_use_verbose_labels: None,
         }
     }
@@ -862,11 +861,11 @@ impl Sidebar {
                 ProjectEvent::WorktreeAdded(_)
                 | ProjectEvent::WorktreeRemoved(_)
                 | ProjectEvent::WorktreeOrderChanged => {
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
                 ProjectEvent::WorktreePathsChanged { old_worktree_paths } => {
                     this.move_entry_paths(project, old_worktree_paths, cx);
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
                 _ => {}
             },
@@ -887,7 +886,7 @@ impl Sidebar {
                         _,
                     )
                 ) {
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
             },
         )
@@ -900,7 +899,7 @@ impl Sidebar {
                 if let workspace::Event::PanelAdded(view) = event {
                     if let Ok(agent_panel) = view.clone().downcast::<AgentPanel>() {
                         this.subscribe_to_agent_panel(workspace, &agent_panel, window, cx);
-                        this.update_entries(cx);
+                        this.schedule_update_entries(false, cx);
                     }
                 }
             },
@@ -992,7 +991,7 @@ impl Sidebar {
                 | AgentPanelEvent::ActiveViewFocused
                 | AgentPanelEvent::EntryChanged => {
                     this.sync_active_entry_from_panel(agent_panel, cx);
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
                 AgentPanelEvent::TerminalClosed { metadata } => {
                     if let Some(workspace) = workspace.upgrade() {
@@ -1002,7 +1001,7 @@ impl Sidebar {
                 }
                 AgentPanelEvent::ThreadInteracted { thread_id } => {
                     this.record_thread_interacted(thread_id, cx);
-                    this.update_entries(cx);
+                    this.schedule_update_entries(false, cx);
                 }
             },
         )
@@ -1858,6 +1857,24 @@ impl Sidebar {
         };
     }
 
+    fn schedule_update_entries(&mut self, select_first_after_update: bool, cx: &mut Context<Self>) {
+        if self.update_task.is_some() && !select_first_after_update {
+            return;
+        }
+
+        self.update_task = Some(cx.spawn(async move |this, cx| {
+            this.update(cx, |this, cx| {
+                this.update_task = None;
+                this.update_entries(cx);
+                if select_first_after_update {
+                    this.select_first_entry();
+                    cx.notify();
+                }
+            })
+            .ok();
+        }));
+    }
+
     /// Rebuilds the sidebar's visible entries from already-cached state.
     fn update_entries(&mut self, cx: &mut Context<Self>) {
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
@@ -1939,8 +1956,8 @@ impl Sidebar {
     /// Re-establishes subscriptions to each visible draft's message editor
     /// so we rebuild entries (and their displayed titles) as the user types.
     fn refresh_draft_editor_observations(&mut self, cx: &mut Context<Self>) {
+        self._draft_editor_observations.clear();
         let Some(multi_workspace) = self.multi_workspace.upgrade() else {
-            self._draft_editor_observations.clear();
             return;
         };
 
@@ -1951,23 +1968,27 @@ impl Sidebar {
             .flat_map(|panel| panel.read(cx).conversation_views())
             .collect();
 
-        let mut subscriptions = Vec::with_capacity(draft_conversation_views.len());
         for cv in draft_conversation_views {
             if let Some(thread_view) = cv.read(cx).active_thread() {
                 let editor = thread_view.read(cx).message_editor.clone();
-                subscriptions.push(cx.observe(&editor, |this, _editor, cx| {
-                    this.update_entries(cx);
-                }));
+                self._draft_editor_observations.push(cx.subscribe(
+                    &editor,
+                    |this, _editor, event, cx| match event {
+                        MessageEditorEvent::Edited => this.schedule_update_entries(false, cx),
+                        _ => (),
+                    },
+                ));
             }
-            // Also observe the ConversationView itself so that editor
+            // Also subscribe to the ConversationView itself so that editor
             // replacements during lifecycle transitions (Loading →
             // Connected) re-wire the editor observation above.
-            subscriptions.push(cx.observe(&cv, |this, _cv, cx| {
-                this.refresh_draft_editor_observations(cx);
-                this.update_entries(cx);
-            }));
+            self._draft_editor_observations.push(cx.subscribe(
+                &cv,
+                |this, _cv, _event: &StateChange, cx| {
+                    this.schedule_update_entries(false, cx);
+                },
+            ));
         }
-        self._draft_editor_observations = subscriptions;
     }
 
     fn select_first_entry(&mut self) {

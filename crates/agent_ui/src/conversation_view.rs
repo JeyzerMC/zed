@@ -456,6 +456,10 @@ pub(crate) struct RootThreadUpdated;
 
 impl EventEmitter<RootThreadUpdated> for ConversationView {}
 
+pub struct StateChange;
+
+impl EventEmitter<StateChange> for ConversationView {}
+
 fn resolve_outcome_from_selection(
     options: &PermissionOptions,
     selection: Option<&thread_view::PermissionSelection>,
@@ -829,6 +833,7 @@ impl ConversationView {
         }
 
         self.server_state = state;
+        cx.emit(StateChange);
         cx.emit(AcpServerViewEvent::ActiveThreadChanged);
         if matches!(&self.server_state, ServerState::Connected(_)) {
             cx.emit(RootThreadUpdated);
@@ -1338,6 +1343,7 @@ impl ConversationView {
             };
             if let Some(connected) = this.as_connected_mut() {
                 connected.auth_state = auth_state;
+                cx.emit(StateChange);
                 if let Some(view) = connected.active_view()
                     && view
                         .read(cx)
@@ -1832,6 +1838,7 @@ impl ConversationView {
             pending_auth_method.replace(method.clone());
 
             let project = self.project.clone();
+            cx.emit(StateChange);
             cx.notify();
             self.auth_task = Some(cx.spawn_in(window, {
                 async move |this, cx| {
@@ -1877,6 +1884,7 @@ impl ConversationView {
                             }) = this.as_connected_mut()
                             {
                                 pending_auth_method.take();
+                                cx.emit(StateChange);
                             }
                             if let Some(active) = this.root_thread_view() {
                                 active.update(cx, |active, cx| {
@@ -1898,6 +1906,7 @@ impl ConversationView {
         pending_auth_method.replace(method.clone());
 
         let authenticate = connection.authenticate(method, cx);
+        cx.emit(StateChange);
         cx.notify();
         self.auth_task = Some(cx.spawn_in(window, {
             async move |this, cx| {
@@ -1925,6 +1934,7 @@ impl ConversationView {
                         }) = this.as_connected_mut()
                         {
                             pending_auth_method.take();
+                            cx.emit(StateChange);
                         }
                         if let Some(active) = this.root_thread_view() {
                             active.update(cx, |active, cx| active.handle_thread_error(err, cx));
@@ -3009,6 +3019,7 @@ impl ConversationView {
                             pending_auth_method: None,
                             _subscription: None,
                         };
+                        cx.emit(StateChange);
                         if let Some(view) = connected.active_view()
                             && view
                                 .read(cx)
