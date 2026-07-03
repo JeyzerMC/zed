@@ -9538,6 +9538,129 @@ async fn test_clipboard_line_numbers_from_multibuffer(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_paste_image_into_markdown(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/notes.md"), Vec::new()).await;
+    let project = Project::test(fs.clone(), [path!("/notes.md").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/notes.md"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+    let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+    let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0, 1, 2, 3]);
+    cx.write_to_clipboard(ClipboardItem::new_image(&image));
+
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multibuffer, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.paste(&Paste, window, cx);
+    });
+    cx.run_until_parked();
+
+    let text = editor.update(cx, |editor, cx| editor.text(cx));
+    assert!(
+        text.starts_with("![](pasted_image_") && text.ends_with(".png)"),
+        "unexpected inserted text: {text:?}"
+    );
+    assert!(
+        fs.files().iter().any(|path| path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("pasted_image_") && name.ends_with(".png"))),
+        "the pasted image was not written next to the markdown file"
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_into_markdown_wraps_selection(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/notes.md"), "caption".into()).await;
+    let project = Project::test(fs.clone(), [path!("/notes.md").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/notes.md"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(markdown_lang()), cx);
+    });
+    let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+    let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0, 1, 2, 3]);
+    cx.write_to_clipboard(ClipboardItem::new_image(&image));
+
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multibuffer, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.select_all(&SelectAll, window, cx);
+        editor.paste(&Paste, window, cx);
+    });
+    cx.run_until_parked();
+
+    let text = editor.update(cx, |editor, cx| editor.text(cx));
+    assert!(
+        text.starts_with("![caption](pasted_image_") && text.ends_with(".png)"),
+        "selection should be used as alt text: {text:?}"
+    );
+}
+
+#[gpui::test]
+async fn test_paste_image_into_non_markdown_is_noop(cx: &mut TestAppContext) {
+    init_test(cx, |_| {});
+
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_file(path!("/main.rs"), Vec::new()).await;
+    let project = Project::test(fs.clone(), [path!("/main.rs").as_ref()], cx).await;
+    let buffer = project
+        .update(cx, |project, cx| {
+            project.open_local_buffer(path!("/main.rs"), cx)
+        })
+        .await
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        buffer.set_language(Some(rust_lang()), cx);
+    });
+    let multibuffer = cx.new(|cx| MultiBuffer::singleton(buffer, cx));
+
+    let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![0, 1, 2, 3]);
+    cx.write_to_clipboard(ClipboardItem::new_image(&image));
+
+    let (editor, cx) = cx.add_window_view(|window, cx| {
+        build_editor_with_project(project.clone(), multibuffer, window, cx)
+    });
+
+    editor.update_in(cx, |editor, window, cx| {
+        editor.paste(&Paste, window, cx);
+    });
+    cx.run_until_parked();
+
+    let text = editor.update(cx, |editor, cx| editor.text(cx));
+    assert_eq!(text, "", "image paste should not affect non-markdown buffers");
+    assert!(
+        !fs.files().iter().any(|path| path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("pasted_image_"))),
+        "no image file should be written for non-markdown buffers"
+    );
+}
+
+#[gpui::test]
 async fn test_paste_multiline(cx: &mut TestAppContext) {
     init_test(cx, |_| {});
 

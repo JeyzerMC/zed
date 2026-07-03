@@ -263,6 +263,15 @@ impl Editor {
         if self.read_only(cx) {
             return;
         }
+
+        if let Some(image) = item.entries().iter().find_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(image),
+            _ => None,
+        }) && self.try_paste_markdown_image(image, window, cx)
+        {
+            return;
+        }
+
         let clipboard_string = item.entries().iter().find_map(|entry| match entry {
             ClipboardEntry::String(s) => Some(s),
             _ => None,
@@ -277,6 +286,113 @@ impl Editor {
             ),
             _ => self.do_paste(&item.text().unwrap_or_default(), None, true, window, cx),
         }
+    }
+
+    /// When pasting an image into a Markdown file, write the image next to the
+    /// file on disk and insert a Markdown image reference at the cursor. Returns
+    /// whether the paste was handled as an image paste.
+    fn try_paste_markdown_image(
+        &mut self,
+        image: &gpui::Image,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let snapshot = self.buffer.read(cx).snapshot(cx);
+        let head = self
+            .selections
+            .newest::<MultiBufferOffset>(&self.display_snapshot(cx))
+            .head();
+        let is_markdown = snapshot
+            .language_at(head)
+            .is_some_and(|language| language.name() == "Markdown");
+        if !is_markdown {
+            return false;
+        }
+
+        let Some(abs_path) = self.target_file_abs_path(cx) else {
+            return false;
+        };
+        let Some(directory) = abs_path.parent() else {
+            return false;
+        };
+        let Some(project) = self.project.clone() else {
+            return false;
+        };
+        let fs = project.read(cx).fs().clone();
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let file_name = format!(
+            "pasted_image_{}.{}",
+            timestamp.as_millis(),
+            image_extension(image.format)
+        );
+        let target_path = directory.join(&file_name);
+        let bytes = image.bytes.clone();
+
+        cx.spawn_in(window, async move |editor, cx| {
+            fs.write(&target_path, &bytes).await?;
+            editor.update_in(cx, |editor, window, cx| {
+                editor.insert_markdown_image_reference(&file_name, window, cx);
+            })?;
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+
+        true
+    }
+
+    fn insert_markdown_image_reference(
+        &mut self,
+        file_name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.transact(window, cx, |this, window, cx| {
+            let selections = this
+                .selections
+                .all::<MultiBufferOffset>(&this.display_snapshot(cx));
+
+            let new_selections = this.buffer.update(cx, |buffer, cx| {
+                let snapshot = buffer.snapshot(cx);
+                let mut edits = Vec::new();
+                let mut markers = Vec::new();
+                for selection in &selections {
+                    let range = selection.start..selection.end;
+                    let alt_text = snapshot.text_for_range(range.clone()).collect::<String>();
+                    let replacement = format!("![{alt_text}]({file_name})");
+                    // Place the cursor between the brackets when there is no alt
+                    // text, otherwise after the whole reference.
+                    let cursor_offset_in_replacement = if alt_text.is_empty() {
+                        MultiBufferOffset("![".len())
+                    } else {
+                        MultiBufferOffset(replacement.len())
+                    };
+                    markers.push((
+                        selection,
+                        snapshot.anchor_before(range.start),
+                        cursor_offset_in_replacement,
+                    ));
+                    edits.push((range, replacement));
+                }
+
+                buffer.edit(edits, None, cx);
+
+                let snapshot = buffer.snapshot(cx);
+                markers
+                    .into_iter()
+                    .map(|(selection, anchor, delta)| {
+                        let cursor = snapshot.anchor_before(anchor.to_offset(&snapshot) + delta);
+                        selection.map(|_| cursor)
+                    })
+                    .collect::<Vec<_>>()
+            });
+
+            this.change_selections(Default::default(), window, cx, |s| {
+                s.select_anchors(new_selections);
+            });
+        });
     }
 
     pub(super) fn cut_common(
@@ -649,6 +765,21 @@ fn edit_for_markdown_paste<'a>(
         Cow::Owned(format!("[{old_text}]({to_insert})"))
     };
     (range, new_text)
+}
+
+fn image_extension(format: gpui::ImageFormat) -> &'static str {
+    use gpui::ImageFormat;
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Pnm => "pnm",
+    }
 }
 
 /// Whether `text` consists solely of a single URL, as opposed to merely
