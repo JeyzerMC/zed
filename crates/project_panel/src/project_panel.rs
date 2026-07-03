@@ -22,7 +22,8 @@ use git_ui::file_diff_view::FileDiffView;
 use gpui::{
     Action, AnyElement, App, AsyncWindowContext, Bounds, ClipboardEntry as GpuiClipboardEntry,
     ClipboardItem, Context, CursorStyle, DismissEvent, Div, DragMoveEvent, Entity, EventEmitter,
-    ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, InteractiveElement, KeyContext,
+    ExternalPaths, FocusHandle, Focusable, FontWeight, Hsla, Image, ImageFormat, InteractiveElement,
+    KeyContext,
     ListHorizontalSizingBehavior, ListSizingBehavior, Modifiers, ModifiersChangedEvent,
     MouseButton, MouseDownEvent, ParentElement, PathPromptOptions, Pixels, Point, PromptLevel,
     Render, ScrollStrategy, Stateful, Styled, Subscription, Task, UniformListScrollHandle,
@@ -3360,6 +3361,11 @@ impl ProjectPanel {
             return;
         }
 
+        if let Some(image) = self.image_from_system_clipboard(cx) {
+            self.paste_clipboard_image(image, window, cx);
+            return;
+        }
+
         maybe!({
             let (worktree, entry) = self.selected_entry_handle(cx)?;
             let entry = entry.clone();
@@ -4144,6 +4150,16 @@ impl ProjectPanel {
         None
     }
 
+    fn image_from_system_clipboard(&self, cx: &App) -> Option<Image> {
+        let clipboard_item = cx.read_from_clipboard()?;
+        for entry in clipboard_item.entries() {
+            if let GpuiClipboardEntry::Image(image) = entry {
+                return Some(image.clone());
+            }
+        }
+        None
+    }
+
     fn has_pasteable_content(&self, cx: &App) -> bool {
         if self
             .clipboard
@@ -4153,6 +4169,7 @@ impl ProjectPanel {
             return true;
         }
         self.external_paths_from_system_clipboard(cx).is_some()
+            || self.image_from_system_clipboard(cx).is_some()
     }
 
     fn selected_entry_handle<'a>(
@@ -4568,6 +4585,72 @@ impl ProjectPanel {
                 }
             }
         });
+    }
+
+    fn paste_clipboard_image(
+        &mut self,
+        image: Image,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((worktree, entry)) = self.selected_sub_entry(cx) else {
+            return;
+        };
+
+        let target_dir = if entry.is_dir() {
+            entry.path.clone()
+        } else {
+            let Some(parent) = entry.path.parent() else {
+                return;
+            };
+            parent.into()
+        };
+
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let filename = format!(
+            "pasted_image_{}.{}",
+            timestamp.as_millis(),
+            image_extension(image.format)
+        );
+        let target_path: Arc<RelPath> = target_dir
+            .join(RelPath::unix(&filename).unwrap())
+            .into();
+
+        let worktree_id = worktree.read(cx).id();
+        let bytes = image.bytes;
+
+        cx.spawn_in(window, async move |project_panel, cx| {
+            let created = worktree.update(cx, |worktree, cx| {
+                worktree.create_entry(target_path, false, Some(bytes), cx)
+            });
+
+            match created.await {
+                Ok(CreatedEntry::Included(entry)) => {
+                    project_panel
+                        .update(cx, |this, cx| {
+                            this.expand_entry(worktree_id, entry.id, cx);
+                            this.selection = Some(SelectedEntry {
+                                worktree_id,
+                                entry_id: entry.id,
+                            });
+                            let path = entry.path.clone();
+                            this.undo_manager
+                                .record(vec![Change::Created(ProjectPath {
+                                    worktree_id,
+                                    path,
+                                })])
+                                .log_err();
+                        })
+                        .ok();
+                }
+                Ok(CreatedEntry::Excluded { .. }) => {}
+                Err(e) => return Err(e.context("failed to paste clipboard image")),
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
     }
 
     fn drop_external_files(
@@ -6809,6 +6892,20 @@ fn item_width_estimate(depth: usize, item_text_chars: usize, is_symlink: bool) -
         item_width += ICON_SIZE_FACTOR;
     }
     item_width
+}
+
+fn image_extension(format: ImageFormat) -> &'static str {
+    match format {
+        ImageFormat::Png => "png",
+        ImageFormat::Jpeg => "jpg",
+        ImageFormat::Webp => "webp",
+        ImageFormat::Gif => "gif",
+        ImageFormat::Svg => "svg",
+        ImageFormat::Bmp => "bmp",
+        ImageFormat::Tiff => "tiff",
+        ImageFormat::Ico => "ico",
+        ImageFormat::Pnm => "pnm",
+    }
 }
 
 impl Render for ProjectPanel {
